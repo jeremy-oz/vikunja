@@ -26,6 +26,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -39,6 +40,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"code.vikunja.io/api/pkg/config"
 	"code.vikunja.io/api/pkg/db"
@@ -77,6 +79,13 @@ type mirrorConfig struct {
 	LabelColumns map[string]string `json:"label_columns"`
 	// DefaultColumn is used for open issues carrying none of the mapped labels.
 	DefaultColumn string `json:"default_column"`
+	// APIToken is an API token of User with tasks.read_one, tasks.update and
+	// tasks_comments.create. With it, issue text and comments are rendered from
+	// Markdown by Vikunja itself; without it they are copied as plain paragraphs.
+	APIToken string `json:"api_token"`
+	// APIURL is Vikunja's own v2 API as seen from the server, by default
+	// http://<service.interface>/api/v2.
+	APIURL string `json:"api_url"`
 }
 
 // mirrorLink remembers which Forgejo item became which Vikunja item.
@@ -89,6 +98,8 @@ type mirrorLink struct {
 	ExtID     int64  `xorm:"'ext_id' bigint notnull index"`
 	TaskID    int64  `xorm:"'task_id' bigint notnull"`
 	CommentID int64  `xorm:"'comment_id' bigint notnull default 0"`
+	// BodyHash is the hash of the Markdown last rendered into the task.
+	BodyHash string `xorm:"'body_hash' varchar(64) notnull default ''"`
 }
 
 type forgejoUser struct {
@@ -159,9 +170,17 @@ func (p *ForgejoMirrorPlugin) Init() error {
 	if cfg.DefaultColumn == "" {
 		cfg.DefaultColumn = "Backlog"
 	}
+	if cfg.APIURL == "" {
+		iface := config.ServiceInterface.GetString()
+		if strings.HasPrefix(iface, ":") {
+			iface = "127.0.0.1" + iface
+		}
+		cfg.APIURL = "http://" + iface + "/api/v2"
+	}
+	cfg.APIURL = strings.TrimRight(cfg.APIURL, "/")
 
 	p.cfg = cfg
-	log.Infof("forgejo-mirror: mirroring %d repositories as user %s", len(cfg.Repos), cfg.User)
+	log.Infof("forgejo-mirror: mirroring %d repositories as user %s (markdown rendering: %t)", len(cfg.Repos), cfg.User, cfg.APIToken != "")
 	return nil
 }
 
@@ -175,6 +194,16 @@ func (p *ForgejoMirrorPlugin) Migrations() []*xormigrate.Migration {
 			},
 			Rollback: func(tx *xorm.Engine) error {
 				return tx.DropTables(linkTable)
+			},
+		},
+		{
+			ID:          "20261010010000-plugin-forgejo-mirror-body-hash",
+			Description: "Add the body hash column to the Forgejo mirror link table",
+			Migrate: func(tx *xorm.Engine) error {
+				return tx.Table(linkTable).Sync2(&mirrorLink{})
+			},
+			Rollback: func(tx *xorm.Engine) error {
+				return nil
 			},
 		},
 	}
@@ -246,7 +275,7 @@ func handleWebhook(c *echo.Context) error {
 	s := db.NewSession()
 	defer s.Close()
 
-	taskID, result, err := mirror(s, cfg, repo, event, payload)
+	taskID, result, pending, err := mirror(s, cfg, repo, event, payload)
 	if err != nil {
 		_ = s.Rollback()
 		log.Errorf("forgejo-mirror: %s#%d: %s", payload.Repository.FullName, payload.Issue.Number, err)
@@ -257,28 +286,148 @@ func handleWebhook(c *echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, "mirroring failed, see the Vikunja log")
 	}
 
+	// Rich text goes through Vikunja's own API so its Markdown converter does the
+	// rendering. This happens after the commit: the API call needs the database.
+	if cfg.APIToken != "" {
+		renderPending(cfg, payload.Repository.FullName, payload.Issue.Number, taskID, pending)
+	}
+
 	return c.JSON(http.StatusOK, map[string]interface{}{"result": result, "task_id": taskID})
+}
+
+// pendingText is the Markdown still to be rendered once the transaction is done.
+type pendingText struct {
+	description     string
+	descriptionHash string
+	comment         string
+	commentID       int64
+}
+
+func renderPending(cfg *mirrorConfig, repoName string, issueNumber, taskID int64, pending *pendingText) {
+	if pending == nil {
+		return
+	}
+
+	if pending.description != "" {
+		if err := putDescription(cfg, taskID, pending.description); err != nil {
+			log.Errorf("forgejo-mirror: %s#%d: rendering the description: %s", repoName, issueNumber, err)
+		} else {
+			s := db.NewSession()
+			_, err := s.Table(linkTable).
+				Where("repo = ? AND kind = ? AND ext_id = ?", repoName, kindIssue, issueNumber).
+				Cols("body_hash").
+				Update(&mirrorLink{BodyHash: pending.descriptionHash})
+			if err == nil {
+				err = s.Commit()
+			}
+			if err != nil {
+				log.Errorf("forgejo-mirror: %s#%d: saving the body hash: %s", repoName, issueNumber, err)
+			}
+			s.Close()
+		}
+	}
+
+	if pending.comment != "" {
+		commentID, err := postComment(cfg, taskID, pending.comment)
+		if err != nil {
+			log.Errorf("forgejo-mirror: %s#%d: creating the comment: %s", repoName, issueNumber, err)
+			return
+		}
+		s := db.NewSession()
+		newLink := &mirrorLink{Repo: repoName, Kind: kindComment, ExtID: pending.commentID, TaskID: taskID, CommentID: commentID}
+		_, err = s.Table(linkTable).Insert(newLink)
+		if err == nil {
+			err = s.Commit()
+		}
+		if err != nil {
+			log.Errorf("forgejo-mirror: %s#%d: saving the comment link: %s", repoName, issueNumber, err)
+		}
+		s.Close()
+	}
+}
+
+var apiClient = &http.Client{Timeout: 20 * time.Second}
+
+func apiCall(cfg *mirrorConfig, method, path string, body interface{}) (map[string]interface{}, error) {
+	var reader io.Reader
+	if body != nil {
+		raw, err := json.Marshal(body)
+		if err != nil {
+			return nil, err
+		}
+		reader = bytes.NewReader(raw)
+	}
+	req, err := http.NewRequest(method, cfg.APIURL+path, reader)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.APIToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := apiClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("%s %s answered %d: %s", method, path, resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	result := map[string]interface{}{}
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &result); err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+// putDescription replaces only the description. PUT takes the whole task, so
+// the current one is read first and sent back with the new text.
+func putDescription(cfg *mirrorConfig, taskID int64, markdown string) error {
+	path := fmt.Sprintf("/tasks/%d", taskID)
+	task, err := apiCall(cfg, http.MethodGet, path, nil)
+	if err != nil {
+		return err
+	}
+	task["description"] = markdown
+	_, err = apiCall(cfg, http.MethodPut, path+"?format=markdown", task)
+	return err
+}
+
+func postComment(cfg *mirrorConfig, taskID int64, markdown string) (int64, error) {
+	created, err := apiCall(cfg, http.MethodPost, fmt.Sprintf("/tasks/%d/comments?format=markdown", taskID), map[string]string{"comment": markdown})
+	if err != nil {
+		return 0, err
+	}
+	id, _ := created["id"].(float64)
+	return int64(id), nil
 }
 
 // mirror brings the task for the issue in line with the payload. Every issue
 // event carries the full issue, so the same upsert serves opened, edited,
 // closed, reopened and label changes alike.
-func mirror(s *xorm.Session, cfg *mirrorConfig, repo repoConfig, event string, payload *forgejoPayload) (taskID int64, result string, err error) {
+func mirror(s *xorm.Session, cfg *mirrorConfig, repo repoConfig, event string, payload *forgejoPayload) (taskID int64, result string, pending *pendingText, err error) {
 	doer, err := user.GetUserByUsername(s, cfg.User)
 	if err != nil {
-		return 0, "", fmt.Errorf("looking up user %s: %w", cfg.User, err)
+		return 0, "", nil, fmt.Errorf("looking up user %s: %w", cfg.User, err)
 	}
 
 	issue := payload.Issue
 	repoName := payload.Repository.FullName
 	closed := issue.State == "closed"
+	rich := cfg.APIToken != ""
+	pending = &pendingText{}
 
 	link := &mirrorLink{}
 	found, err := s.Table(linkTable).
 		Where("repo = ? AND kind = ? AND ext_id = ?", repoName, kindIssue, issue.Number).
 		Get(link)
 	if err != nil {
-		return 0, "", err
+		return 0, "", nil, err
 	}
 
 	task := &models.Task{}
@@ -290,11 +439,11 @@ func mirror(s *xorm.Session, cfg *mirrorConfig, repo repoConfig, event string, p
 		case models.IsErrTaskDoesNotExist(err):
 			// The task was deleted in Vikunja; forget the link and start over.
 			if _, err := s.Table(linkTable).Where("id = ?", link.ID).Delete(&mirrorLink{}); err != nil {
-				return 0, "", err
+				return 0, "", nil, err
 			}
 			found = false
 		default:
-			return 0, "", err
+			return 0, "", nil, err
 		}
 	}
 
@@ -302,31 +451,47 @@ func mirror(s *xorm.Session, cfg *mirrorConfig, repo repoConfig, event string, p
 	if title == "" {
 		title = fmt.Sprintf("%s#%d", repoName, issue.Number)
 	}
-	description := describe(repoName, issue)
+	plain := describe(repoName, issue)
+	markdown := describeMarkdown(repoName, issue)
+	hash := hashOf(markdown)
 
 	if !found {
 		task = &models.Task{
 			Title:       title,
-			Description: description,
+			Description: plain,
 			ProjectID:   repo.ProjectID,
 			Done:        closed,
 		}
 		if err := task.Create(s, doer); err != nil {
-			return 0, "", fmt.Errorf("creating the task: %w", err)
+			return 0, "", nil, fmt.Errorf("creating the task: %w", err)
 		}
 		newLink := &mirrorLink{Repo: repoName, Kind: kindIssue, ExtID: issue.Number, TaskID: task.ID}
 		if _, err := s.Table(linkTable).Insert(newLink); err != nil {
-			return 0, "", err
+			return 0, "", nil, err
+		}
+		if rich {
+			pending.description = markdown
+			pending.descriptionHash = hash
 		}
 		result = "created"
 	} else {
 		result = "unchanged"
-		if task.Title != title || task.Description != description || task.Done != closed {
+		changed := task.Title != title || task.Done != closed
+		if rich {
+			if link.BodyHash != hash {
+				pending.description = markdown
+				pending.descriptionHash = hash
+				result = "updated"
+			}
+		} else if task.Description != plain {
+			task.Description = plain
+			changed = true
+		}
+		if changed {
 			task.Title = title
-			task.Description = description
 			task.Done = closed
 			if err := task.Update(s, doer); err != nil {
-				return 0, "", fmt.Errorf("updating the task: %w", err)
+				return 0, "", nil, fmt.Errorf("updating the task: %w", err)
 			}
 			result = "updated"
 		}
@@ -336,7 +501,7 @@ func mirror(s *xorm.Session, cfg *mirrorConfig, repo repoConfig, event string, p
 	if !closed {
 		moved, err := placeInColumn(s, doer, task.ID, repo.ProjectID, columnFor(cfg, issue))
 		if err != nil {
-			return 0, "", err
+			return 0, "", nil, err
 		}
 		if moved && result == "unchanged" {
 			result = "moved"
@@ -344,37 +509,36 @@ func mirror(s *xorm.Session, cfg *mirrorConfig, repo repoConfig, event string, p
 	}
 
 	if event == "issue_comment" && payload.Comment != nil && payload.Action == "created" {
-		added, err := mirrorComment(s, doer, repoName, task.ID, payload.Comment)
+		exists, err := s.Table(linkTable).
+			Where("repo = ? AND kind = ? AND ext_id = ?", repoName, kindComment, payload.Comment.ID).
+			Exist()
 		if err != nil {
-			return 0, "", err
+			return 0, "", nil, err
 		}
-		if added {
+		if !exists {
+			if rich {
+				pending.comment = "**" + payload.Comment.User.Login + "** on Forgejo:\n\n" + payload.Comment.Body
+				pending.commentID = payload.Comment.ID
+			} else if err := mirrorComment(s, doer, repoName, task.ID, payload.Comment); err != nil {
+				return 0, "", nil, err
+			}
 			result = "commented"
 		}
 	}
 
-	return task.ID, result, nil
+	return task.ID, result, pending, nil
 }
 
-func mirrorComment(s *xorm.Session, doer *user.User, repoName string, taskID int64, comment *forgejoComment) (added bool, err error) {
-	exists, err := s.Table(linkTable).
-		Where("repo = ? AND kind = ? AND ext_id = ?", repoName, kindComment, comment.ID).
-		Exist()
-	if err != nil || exists {
-		return false, err
-	}
-
+func mirrorComment(s *xorm.Session, doer *user.User, repoName string, taskID int64, comment *forgejoComment) error {
 	text := "<p><strong>" + html.EscapeString(comment.User.Login) + "</strong> on Forgejo:</p>" + toHTML(comment.Body)
 	tc := &models.TaskComment{Comment: text, TaskID: taskID}
 	if err := tc.Create(s, doer); err != nil {
-		return false, fmt.Errorf("creating the comment: %w", err)
+		return fmt.Errorf("creating the comment: %w", err)
 	}
 
 	newLink := &mirrorLink{Repo: repoName, Kind: kindComment, ExtID: comment.ID, TaskID: taskID, CommentID: tc.ID}
-	if _, err := s.Table(linkTable).Insert(newLink); err != nil {
-		return false, err
-	}
-	return true, nil
+	_, err := s.Table(linkTable).Insert(newLink)
+	return err
 }
 
 // columnFor picks the kanban column for an open issue from its labels.
@@ -445,8 +609,27 @@ func describe(repoName string, issue *forgejoIssue) string {
 	return header + toHTML(issue.Body)
 }
 
+// describeMarkdown is the description as Markdown, for Vikunja to render.
+func describeMarkdown(repoName string, issue *forgejoIssue) string {
+	header := fmt.Sprintf("Mirrored from [%s#%d](%s)", repoName, issue.Number, issue.HTMLURL)
+	if issue.User.Login != "" {
+		header += ", opened by " + issue.User.Login
+	}
+	header += ". Edit it there: changes made here are overwritten."
+	body := strings.TrimSpace(strings.ReplaceAll(issue.Body, "\r\n", "\n"))
+	if body == "" {
+		return header
+	}
+	return header + "\n\n---\n\n" + body
+}
+
+func hashOf(text string) string {
+	sum := sha256.Sum256([]byte(text))
+	return hex.EncodeToString(sum[:])
+}
+
 // toHTML turns Forgejo's Markdown source into plain, safe paragraphs. It does
-// not render Markdown; the text stays readable and nothing is interpreted.
+// not render Markdown; it is the fallback when no API token is configured.
 func toHTML(text string) string {
 	text = strings.TrimSpace(strings.ReplaceAll(text, "\r\n", "\n"))
 	if text == "" {
