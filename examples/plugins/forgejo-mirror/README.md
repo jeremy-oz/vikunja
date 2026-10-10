@@ -17,6 +17,8 @@ It runs inside the stock Vikunja binary through the Yaegi plugin loader, so no c
 | Issue reopened | Task marked not done and placed by its labels again |
 | Comment added | Comment added to the task, prefixed with the Forgejo author |
 
+Every mirrored task carries a `forgejo` label, so it stands out from tasks created in Vikunja. Set `"label"` in the config to rename it, or to `"none"` to switch it off.
+
 Not mirrored: pull requests, edited or deleted comments, assignees, milestones, attachments, and labels other than the ones mapped to columns.
 
 Issue text and comments are Markdown in Forgejo. With an `api_token` in the config they are rendered by Vikunja's own converter (headings, lists, checkboxes, code blocks, tables). Without one they are copied as plain paragraphs.

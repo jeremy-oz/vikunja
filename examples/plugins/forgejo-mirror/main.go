@@ -79,6 +79,11 @@ type mirrorConfig struct {
 	LabelColumns map[string]string `json:"label_columns"`
 	// DefaultColumn is used for open issues carrying none of the mapped labels.
 	DefaultColumn string `json:"default_column"`
+	// Label is the title of the label put on every mirrored task so they stand
+	// out from tasks created in Vikunja. Defaults to "forgejo"; "none" disables it.
+	Label string `json:"label"`
+	// LabelColor is the hex colour used when the label has to be created.
+	LabelColor string `json:"label_color"`
 	// APIToken is an API token of User with tasks.read_one, tasks.update and
 	// tasks_comments.create. With it, issue text and comments are rendered from
 	// Markdown by Vikunja itself; without it they are copied as plain paragraphs.
@@ -169,6 +174,12 @@ func (p *ForgejoMirrorPlugin) Init() error {
 	}
 	if cfg.DefaultColumn == "" {
 		cfg.DefaultColumn = "Backlog"
+	}
+	if cfg.Label == "" {
+		cfg.Label = "forgejo"
+	}
+	if cfg.LabelColor == "" {
+		cfg.LabelColor = "d9480f"
 	}
 	if cfg.APIURL == "" {
 		iface := config.ServiceInterface.GetString()
@@ -497,6 +508,12 @@ func mirror(s *xorm.Session, cfg *mirrorConfig, repo repoConfig, event string, p
 		}
 	}
 
+	if cfg.Label != "none" {
+		if err := ensureLabel(s, doer, task.ID, cfg.Label, cfg.LabelColor); err != nil {
+			return 0, "", nil, err
+		}
+	}
+
 	// Closed issues are left where Vikunja's done handling put them.
 	if !closed {
 		moved, err := placeInColumn(s, doer, task.ID, repo.ProjectID, columnFor(cfg, issue))
@@ -539,6 +556,32 @@ func mirrorComment(s *xorm.Session, doer *user.User, repoName string, taskID int
 	newLink := &mirrorLink{Repo: repoName, Kind: kindComment, ExtID: comment.ID, TaskID: taskID, CommentID: tc.ID}
 	_, err := s.Table(linkTable).Insert(newLink)
 	return err
+}
+
+// ensureLabel makes sure the task carries the mirror's label, creating the label
+// on first use. The label belongs to the mirror's user.
+func ensureLabel(s *xorm.Session, doer *user.User, taskID int64, title, color string) error {
+	label := &models.Label{}
+	found, err := s.Where("title = ? AND created_by_id = ?", title, doer.ID).Get(label)
+	if err != nil {
+		return err
+	}
+	if !found {
+		label = &models.Label{Title: title, HexColor: color, Description: "Mirrored from Forgejo. Edit the issue there."}
+		if err := label.Create(s, doer); err != nil {
+			return fmt.Errorf("creating the label %q: %w", title, err)
+		}
+	}
+
+	attached, err := s.Where("label_id = ? AND task_id = ?", label.ID, taskID).Exist(&models.LabelTask{})
+	if err != nil || attached {
+		return err
+	}
+	lt := &models.LabelTask{LabelID: label.ID, TaskID: taskID}
+	if err := lt.Create(s, doer); err != nil {
+		return fmt.Errorf("labelling the task: %w", err)
+	}
+	return nil
 }
 
 // columnFor picks the kanban column for an open issue from its labels.
