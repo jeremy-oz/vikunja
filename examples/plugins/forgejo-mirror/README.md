@@ -12,14 +12,17 @@ It runs inside the stock Vikunja binary through the Yaegi plugin loader, so no c
 |---|---|
 | Issue opened | Task created in the mapped project, with a link back to the issue |
 | Title or text edited | Task title and description updated |
-| Label changed | Task moved to the column mapped to that label |
+| Label mapped to a column added or removed | Task moved to the column mapped to that label |
+| Any other label added or removed | Same label added to or removed from the task, created on first use with Forgejo's colour and description |
 | Issue closed | Task marked done (Vikunja moves it to the done column) |
 | Issue reopened | Task marked not done and placed by its labels again |
 | Comment added | Comment added to the task, prefixed with the Forgejo author |
 
 Every mirrored task carries a `forgejo` label, so it stands out from tasks created in Vikunja. Set `"label"` in the config to rename it, or to `"none"` to switch it off.
 
-Not mirrored: pull requests, edited or deleted comments, assignees, milestones, attachments, and labels other than the ones mapped to columns.
+Mirrored labels belong to the mirror's user. Only those are taken off a task when they leave the issue; a label somebody else puts on a mirrored task in Vikunja is left alone. Labels are matched by name across all mapped repositories, so two repositories using the same label name share one Vikunja label (the colour follows the issue seen last).
+
+Not mirrored: pull requests, edited or deleted comments, assignees, milestones, and attachments.
 
 Issue text and comments are Markdown in Forgejo. With an `api_token` in the config they are rendered by Vikunja's own converter (headings, lists, checkboxes, code blocks, tables). Without one they are copied as plain paragraphs.
 

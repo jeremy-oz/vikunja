@@ -81,6 +81,7 @@ type mirrorConfig struct {
 	DefaultColumn string `json:"default_column"`
 	// Label is the title of the label put on every mirrored task so they stand
 	// out from tasks created in Vikunja. Defaults to "forgejo"; "none" disables it.
+	// The issue's own labels are copied as well, except the ones in LabelColumns.
 	Label string `json:"label"`
 	// LabelColor is the hex colour used when the label has to be created.
 	LabelColor string `json:"label_color"`
@@ -112,7 +113,9 @@ type forgejoUser struct {
 }
 
 type forgejoLabel struct {
-	Name string `json:"name"`
+	Name        string `json:"name"`
+	Color       string `json:"color"`
+	Description string `json:"description"`
 }
 
 type forgejoIssue struct {
@@ -150,7 +153,7 @@ type ForgejoMirrorPlugin struct {
 }
 
 func (p *ForgejoMirrorPlugin) Name() string    { return "forgejo-mirror" }
-func (p *ForgejoMirrorPlugin) Version() string { return "0.1.0" }
+func (p *ForgejoMirrorPlugin) Version() string { return "0.2.0" }
 func (p *ForgejoMirrorPlugin) Shutdown() error { return nil }
 
 func (p *ForgejoMirrorPlugin) Init() error {
@@ -508,10 +511,12 @@ func mirror(s *xorm.Session, cfg *mirrorConfig, repo repoConfig, event string, p
 		}
 	}
 
-	if cfg.Label != "none" {
-		if err := ensureLabel(s, doer, task.ID, cfg.Label, cfg.LabelColor); err != nil {
-			return 0, "", nil, err
-		}
+	labelled, err := syncLabels(s, doer, task.ID, cfg, issue)
+	if err != nil {
+		return 0, "", nil, err
+	}
+	if labelled && result == "unchanged" {
+		result = "labelled"
 	}
 
 	// Closed issues are left where Vikunja's done handling put them.
@@ -558,30 +563,102 @@ func mirrorComment(s *xorm.Session, doer *user.User, repoName string, taskID int
 	return err
 }
 
-// ensureLabel makes sure the task carries the mirror's label, creating the label
-// on first use. The label belongs to the mirror's user.
-func ensureLabel(s *xorm.Session, doer *user.User, taskID int64, title, color string) error {
-	label := &models.Label{}
-	found, err := s.Where("title = ? AND created_by_id = ?", title, doer.ID).Get(label)
-	if err != nil {
-		return err
+// syncLabels makes the task carry the mirror's own label plus every label of
+// the issue that is not mapped to a column, and takes off the ones removed from
+// the issue. Labels are created on first use with Forgejo's colour and belong
+// to the mirror's user; only those are ever removed, so a label somebody else
+// put on the task in Vikunja stays.
+func syncLabels(s *xorm.Session, doer *user.User, taskID int64, cfg *mirrorConfig, issue *forgejoIssue) (changed bool, err error) {
+	wanted := []forgejoLabel{}
+	seen := map[string]bool{}
+	if cfg.Label != "none" {
+		wanted = append(wanted, forgejoLabel{Name: cfg.Label, Color: cfg.LabelColor, Description: "Mirrored from Forgejo. Edit the issue there."})
+		seen[cfg.Label] = true
 	}
-	if !found {
-		label = &models.Label{Title: title, HexColor: color, Description: "Mirrored from Forgejo. Edit the issue there."}
-		if err := label.Create(s, doer); err != nil {
-			return fmt.Errorf("creating the label %q: %w", title, err)
+	for _, label := range issue.Labels {
+		name := strings.TrimSpace(label.Name)
+		if _, isColumn := cfg.LabelColumns[label.Name]; isColumn || name == "" || seen[name] {
+			continue
 		}
+		seen[name] = true
+		wanted = append(wanted, forgejoLabel{Name: name, Color: label.Color, Description: strings.TrimSpace(label.Description)})
 	}
 
-	attached, err := s.Where("label_id = ? AND task_id = ?", label.ID, taskID).Exist(&models.LabelTask{})
-	if err != nil || attached {
-		return err
+	owned := []*models.Label{}
+	if err := s.Where("created_by_id = ?", doer.ID).OrderBy("id asc").Find(&owned); err != nil {
+		return false, err
 	}
-	lt := &models.LabelTask{LabelID: label.ID, TaskID: taskID}
-	if err := lt.Create(s, doer); err != nil {
-		return fmt.Errorf("labelling the task: %w", err)
+	byTitle := map[string]*models.Label{}
+	byID := map[int64]*models.Label{}
+	for _, label := range owned {
+		if _, taken := byTitle[label.Title]; !taken {
+			byTitle[label.Title] = label
+		}
+		byID[label.ID] = label
 	}
-	return nil
+
+	links := []*models.LabelTask{}
+	if err := s.Where("task_id = ?", taskID).Find(&links); err != nil {
+		return false, err
+	}
+	attached := map[int64]bool{}
+	for _, link := range links {
+		attached[link.LabelID] = true
+	}
+
+	for _, want := range wanted {
+		color := hexColor(want.Color)
+		label, found := byTitle[want.Name]
+		if !found {
+			label = &models.Label{Title: want.Name, HexColor: color, Description: want.Description}
+			if err := label.Create(s, doer); err != nil {
+				return false, fmt.Errorf("creating the label %q: %w", want.Name, err)
+			}
+			byTitle[label.Title] = label
+			byID[label.ID] = label
+		} else if label.HexColor != color || label.Description != want.Description {
+			label.HexColor = color
+			label.Description = want.Description
+			if _, err := s.ID(label.ID).Cols("hex_color", "description").Update(label); err != nil {
+				return false, fmt.Errorf("updating the label %q: %w", want.Name, err)
+			}
+		}
+		if attached[label.ID] {
+			continue
+		}
+		lt := &models.LabelTask{LabelID: label.ID, TaskID: taskID}
+		if err := lt.Create(s, doer); err != nil {
+			return false, fmt.Errorf("labelling the task with %q: %w", want.Name, err)
+		}
+		attached[label.ID] = true
+		changed = true
+	}
+
+	for _, link := range links {
+		label, mine := byID[link.LabelID]
+		if !mine || seen[label.Title] {
+			continue
+		}
+		lt := &models.LabelTask{LabelID: link.LabelID, TaskID: taskID}
+		if err := lt.Delete(s, doer); err != nil {
+			return false, fmt.Errorf("taking the label %q off the task: %w", label.Title, err)
+		}
+		changed = true
+	}
+
+	return changed, nil
+}
+
+// hexColor is a colour the way Vikunja stores it: six hex digits, no "#".
+func hexColor(color string) string {
+	color = strings.ToLower(strings.TrimPrefix(strings.TrimSpace(color), "#"))
+	if len(color) != 6 {
+		return ""
+	}
+	if _, err := hex.DecodeString(color); err != nil {
+		return ""
+	}
+	return color
 }
 
 // columnFor picks the kanban column for an open issue from its labels.
