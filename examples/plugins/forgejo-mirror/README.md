@@ -10,7 +10,7 @@ It runs inside the stock Vikunja binary through the Yaegi plugin loader, so no c
 
 | In Forgejo | In Vikunja |
 |---|---|
-| Issue opened | Task created in the mapped project, with a link back to the issue |
+| Issue opened | Task created in the mapped project, titled `#<issue number> <issue title>`, with a link back to the issue |
 | Title or text edited | Task title and description updated |
 | Label mapped to a column added or removed | Task moved to the column mapped to that label |
 | Any other label added or removed | Same label added to or removed from the task, created on first use with Forgejo's colour and description |
@@ -74,6 +74,8 @@ Existing issues appear in Vikunja the first time something changes on them. Ther
    - HTTP method `POST`, content type `application/json`
    - Secret: the same string as in the config file
    - Trigger on: Issues, Issue labelled, Issue comment
+
+Vikunja gives every task its own number, which differs from the issue number and is left alone, so that tasks created in Vikunja and mirrored ones share one numbering. The issue number at the front of the title is what links a card to its issue.
 
 ## How it works
 

@@ -153,7 +153,7 @@ type ForgejoMirrorPlugin struct {
 }
 
 func (p *ForgejoMirrorPlugin) Name() string    { return "forgejo-mirror" }
-func (p *ForgejoMirrorPlugin) Version() string { return "0.2.0" }
+func (p *ForgejoMirrorPlugin) Version() string { return "0.3.0" }
 func (p *ForgejoMirrorPlugin) Shutdown() error { return nil }
 
 func (p *ForgejoMirrorPlugin) Init() error {
@@ -461,10 +461,13 @@ func mirror(s *xorm.Session, cfg *mirrorConfig, repo repoConfig, event string, p
 		}
 	}
 
+	// The issue number leads the title: Vikunja numbers tasks on its own, so
+	// this is what ties the card to the issue at a glance.
 	title := strings.TrimSpace(issue.Title)
 	if title == "" {
-		title = fmt.Sprintf("%s#%d", repoName, issue.Number)
+		title = repoName
 	}
+	title = fmt.Sprintf("#%d %s", issue.Number, title)
 	plain := describe(repoName, issue)
 	markdown := describeMarkdown(repoName, issue)
 	hash := hashOf(markdown)
